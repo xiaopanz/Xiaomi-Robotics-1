@@ -9,16 +9,53 @@ import traceback
 import torch
 from tqdm import tqdm
 from transformers import AutoModel
+import trace_rpc
 
 
 class Server:
     def __init__(self, model_path, host, port):
         self.host = host
         self.port = port
+        self.model_path = model_path
+        self._trace_identity = None
 
         print("Loading model...")
         self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16).cuda().to(torch.bfloat16)
         print("Model loaded.")
+
+    def handle(self, request):
+        op = request.get('_trace_op')
+        if op is not None:
+            if request.get('protocol') != trace_rpc.PROTOCOL:
+                raise ValueError('Unsupported TRACE-MM protocol')
+            if op == 'hello':
+                if self._trace_identity is None:
+                    self._trace_identity = trace_rpc.model_identity(self.model_path)
+                return {'protocol': trace_rpc.PROTOCOL, 'model': self._trace_identity,
+                        'runtime': trace_rpc.runtime_identity(), 'training': self.model.training}
+            if op == 'get_rng':
+                return trace_rpc.get_rng()
+            if op == 'set_rng':
+                trace_rpc.set_rng(request['state'])
+                return {'ok': True}
+            if op == 'seed':
+                trace_rpc.seed_rng(request['seed'])
+                return trace_rpc.get_rng()
+            if op != 'infer':
+                raise ValueError(f'Unknown TRACE-MM operation: {op}')
+            request = request['request']
+            before = trace_rpc.get_rng()
+            fingerprint = trace_rpc.request_hash(request)
+        data = {key: (value.to(device=self.model.device, dtype=self.model.dtype)
+                      if isinstance(value, torch.Tensor) and value.is_floating_point()
+                      else value.to(device=self.model.device) if isinstance(value, torch.Tensor)
+                      else value) for key, value in request.items()}
+        outputs = self.model(**data)
+        actions = outputs.actions.cpu()
+        if op == 'infer':
+            return {'actions': actions, 'rng_before': before, 'rng_after': trace_rpc.get_rng(),
+                    'request_sha256': fingerprint}
+        return actions
 
     def _recv_all(self, conn, length):
         data = b""
@@ -55,12 +92,7 @@ class Server:
                             tic = time.time()
 
                             input_data = pickle.loads(data)
-                            robot_type = input_data["task_id"]
-                            data = {key: (value.to(device=self.model.device, dtype=self.model.dtype) if isinstance(value, torch.Tensor) and value.is_floating_point() else value.to(device=self.model.device) if isinstance(value, torch.Tensor) else value) for key, value in input_data.items()}
-
-                            outputs = self.model(**data)
-
-                            response = pickle.dumps(outputs.actions.cpu())
+                            response = pickle.dumps(self.handle(input_data))
                             conn.sendall(struct.pack(">I", len(response)) + response)
 
                             toc = time.time()

@@ -20,6 +20,8 @@ class Client:
         self.host = host
         self.port = port
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True, use_fast=False) if model_path else None
+        self.record_trace = False
+        self.last_trace = None
         self._connect_with_retry(max_retries=None, retry_interval=1)
         print(f"Client connected to server at {self.host}:{self.port}.")
 
@@ -42,9 +44,7 @@ class Client:
         self.client_socket.sendall(struct.pack(">I", len(serialized)) + serialized)
 
     def _recv_with_length_prefix(self):
-        len_data = self.client_socket.recv(4)
-        if not len_data or len(len_data) < 4:
-            raise ConnectionError("Failed to receive response length prefix.")
+        len_data = self._recv_all(4)
         data_len = struct.unpack(">I", len_data)[0]
         data = b""
         while len(data) < data_len:
@@ -54,10 +54,27 @@ class Client:
             data += packet
         return pickle.loads(data)
 
+    def _recv_all(self, size):
+        result = b''
+        while len(result) < size:
+            packet = self.client_socket.recv(size - len(result))
+            if not packet:
+                raise ConnectionError('Connection closed while receiving response')
+            result += packet
+        return result
+
+    def trace_control(self, operation, **kwargs):
+        self._send_with_length_prefix({'_trace_op': operation, 'protocol': 1, **kwargs})
+        return self._recv_with_length_prefix()
+
     def __call__(self, **data):
         robot_type = data.get("task_id")
-        self._send_with_length_prefix(data)
-        actions = self._recv_with_length_prefix()
+        if self.record_trace:
+            self.last_trace = self.trace_control('infer', request=data)
+            actions = self.last_trace['actions']
+        else:
+            self._send_with_length_prefix(data)
+            actions = self._recv_with_length_prefix()
         action = self.processor.decode_action(actions, robot_type=robot_type)
         return action
 
